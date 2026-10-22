@@ -457,6 +457,39 @@ function readGroups(data) {
   }
 }
 
+/** Each counted board with its own groups, for the popover split. Names only, never cards. */
+function readBoards(data) {
+  const source = data && Array.isArray(data.boards) ? data.boards : []
+  return source
+    .filter(board => board && typeof board === 'object')
+    .map(board => ({
+      name: String(board.name || board.slug || '').slice(0, 32),
+      groups: readGroups({ groups: board.groups })
+    }))
+}
+
+function readUnreadable(data) {
+  const source = data && Array.isArray(data.unreadable) ? data.unreadable : []
+  return source.map(slug => String(slug).slice(0, 32))
+}
+
+/**
+ * "By board: work 34, default 7" for one group, largest first, at most four
+ * boards. Empty when only one board is counted or none holds a card in the
+ * group, so a single-board setup reads exactly as before.
+ */
+function byBoard(boards, key) {
+  if (boards.length < 2) return ''
+  const parts = boards
+    .map(board => ({ name: board.name, count: board.groups[key] }))
+    .filter(entry => entry.count > 0)
+    .sort((a, b) => b.count - a.count)
+  if (parts.length === 0) return ''
+  const shown = parts.slice(0, 4).map(entry => `${entry.name} ${entry.count}`)
+  if (parts.length > 4) shown.push(`${parts.length - 4} more`)
+  return `By board: ${shown.join(', ')}`
+}
+
 function readWorkers(data) {
   const source = data && typeof data.workers === 'object' && data.workers !== null ? data.workers : {}
   const active = toCount(source.active)
@@ -511,9 +544,10 @@ function cardTitle(card) {
   return title || String(card.id ?? 'untitled')
 }
 
-/** Row meta: the card id, then its age. Either half can be missing. */
-function cardMeta(card, now) {
-  return [String(card.id ?? ''), ageLabel(cardStamp(card), now)].filter(Boolean).join('  ')
+/** Row meta: the board when several are counted, the card id, then its age. Any part can be missing. */
+function cardMeta(card, now, multi = false) {
+  const board = multi && typeof card.board_name === 'string' ? card.board_name : ''
+  return [board, String(card.id ?? ''), ageLabel(cardStamp(card), now)].filter(Boolean).join('  ')
 }
 
 // -- data hooks ---------------------------------------------------------------
@@ -588,6 +622,7 @@ function useCardDetail(ctx, id, enabled) {
   const data = failed ? null : query.data
   return {
     attachments: data?.attachments ?? { count: 0, names: [] },
+    board: data?.board ?? null,
     card: data?.card ?? null,
     comments: data?.comments ?? { count: 0, recent: [] },
     error: failed,
@@ -688,7 +723,7 @@ function commentsBody(comments) {
  * attachments. Read-only, and it says where the actions are instead of faking
  * them: a plugin cannot reach the Kanban plugin's own API.
  */
-function CardPreview({ detail, onOpen }) {
+function CardPreview({ detail, multi, onOpen }) {
   if (!detail.card) {
     return jsx('div', {
       style: NOTE_STYLE,
@@ -702,6 +737,9 @@ function CardPreview({ detail, onOpen }) {
 
   const pills = [
     jsx(PanelPill, { key: 'status', tone: statusTone(card.status), children: String(card.status ?? '') }),
+    multi && detail.board?.name
+      ? jsx(PanelPill, { key: 'board', tone: 'muted', children: String(detail.board.name) })
+      : null,
     card.priority ? jsx(PanelPill, { key: 'priority', tone: 'muted', children: `p${card.priority}` }) : null,
     card.goal_mode ? jsx(PanelPill, { key: 'goal', tone: 'muted', children: 'goal loop' }) : null
   ].filter(Boolean)
@@ -807,7 +845,7 @@ function CardPreview({ detail, onOpen }) {
  * being read. Escape, a click outside, or the shell's own close button dismiss
  * it.
  */
-function CardPanel({ ctx, card, onOpen, onClose }) {
+function CardPanel({ ctx, card, multi, onOpen, onClose }) {
   const detail = useCardDetail(ctx, card, card !== null)
 
   return jsx(Dialog, {
@@ -826,7 +864,7 @@ function CardPanel({ ctx, card, onOpen, onClose }) {
       onPointerMove: markInside,
       overlayClassName: OVERLAY_DIM,
       style: CARD_STYLE,
-      children: card === null ? null : jsx(CardPreview, { detail, onOpen })
+      children: card === null ? null : jsx(CardPreview, { detail, multi, onOpen })
     })
   })
 }
@@ -838,7 +876,7 @@ function CardPanel({ ctx, card, onOpen, onClose }) {
  * overlay replaces the previous card rather than stacking, so sweeping the list
  * walks the overlay through each card.
  */
-function CardRow({ card, group, now, onOpen, slot }) {
+function CardRow({ card, group, multi, now, onOpen, slot }) {
   const spec = GROUPS[group] ?? GROUPS.queued
   const hover = useValue($hover)
   const active = hover !== null && hover.slot === slot && hover.card === card.id
@@ -851,7 +889,7 @@ function CardRow({ card, group, now, onOpen, slot }) {
     children: jsx(PanelListRow, {
       active,
       lead: jsx('span', { style: { ...DOT_STYLE, backgroundColor: dot } }),
-      meta: cardMeta(card, now),
+      meta: cardMeta(card, now, multi),
       onSelect: () => onOpen(card),
       rowKey: String(card.id ?? cardTitle(card)),
       title: cardTitle(card)
@@ -859,7 +897,7 @@ function CardRow({ card, group, now, onOpen, slot }) {
   })
 }
 
-function PopoverBody({ cards, ctx, error, group, loading, now, onOpen, slot, total }) {
+function PopoverBody({ cards, ctx, error, group, loading, multi, now, onOpen, slot, total }) {
   if (error) {
     return jsx('div', { style: NOTE_STYLE, children: 'This connection has no card list yet.' })
   }
@@ -876,7 +914,7 @@ function PopoverBody({ cards, ctx, error, group, loading, now, onOpen, slot, tot
   const rows = cards.map(card => jsx(CardPrefetch, { ctx, id: card.id, key: `warm-${card.id}` }))
   rows.push(
     ...cards.map(card =>
-      jsx(CardRow, { card, group, key: String(card.id ?? cardTitle(card)), now, onOpen, slot })
+      jsx(CardRow, { card, group, key: String(card.id ?? cardTitle(card)), multi, now, onOpen, slot })
     )
   )
 
@@ -894,7 +932,7 @@ function PopoverBody({ cards, ctx, error, group, loading, now, onOpen, slot, tot
  * list and one card are ever up, and both stay up while the pointer is on them.
  * Focus opens the list too, so it is reachable from the keyboard.
  */
-function CountWithCards({ ctx, count, group, icon, label, slot, tone, showDot }) {
+function CountWithCards({ ctx, count, group, icon, label, multi, slot, split, tone, showDot }) {
   const spec = GROUPS[group] ?? GROUPS.queued
   const hover = useValue($hover)
   const open = hover !== null && hover.slot === slot
@@ -955,12 +993,14 @@ function CountWithCards({ ctx, count, group, icon, label, slot, tone, showDot })
             jsx(PanelPill, { tone: spec.tone, children: String(total || count) })
           ]
         }),
+        split ? jsx('div', { key: 'split', style: NOTE_STYLE, children: split }) : null,
         jsx(PopoverBody, {
           cards,
           ctx,
           error,
           group,
           loading,
+          multi,
           now: Math.floor(Date.now() / 1000),
           onOpen: openBoard,
           slot,
@@ -991,6 +1031,10 @@ function WorkerStrip({ ctx }) {
 
   const groups = readGroups(data)
   const workers = readWorkers(data)
+  const boards = readBoards(data)
+  const unreadable = readUnreadable(data)
+  // Board names appear in the popovers only when more than one board is counted.
+  const multi = boards.length > 1
 
   if (error) {
     return jsx('span', {
@@ -1025,6 +1069,8 @@ function WorkerStrip({ ctx }) {
         ctx,
         count: groups.queued,
         group: 'queued',
+        multi,
+        split: byBoard(boards, 'queued'),
         icon: jsx(icons.CircleIcon, { className: 'shrink-0 size-3', style: { color: LABEL_COLOR } }),
         label: 'queued',
         tone: QUIET_COLOR
@@ -1040,6 +1086,8 @@ function WorkerStrip({ ctx }) {
         ctx,
         count: groups.scheduled,
         group: 'scheduled',
+        multi,
+        split: byBoard(boards, 'scheduled'),
         icon: jsx(icons.Clock, { className: 'shrink-0 size-3', style: { color: LABEL_COLOR } }),
         label: 'scheduled',
         tone: QUIET_COLOR
@@ -1055,6 +1103,8 @@ function WorkerStrip({ ctx }) {
         ctx,
         count: groups.running,
         group: 'running',
+        multi,
+        split: byBoard(boards, 'running'),
         label: 'running',
         showDot: true,
         tone: stateColor(workers.state)
@@ -1070,6 +1120,8 @@ function WorkerStrip({ ctx }) {
         ctx,
         count: groups.blocked,
         group: 'blocked',
+        multi,
+        split: byBoard(boards, 'blocked'),
         icon: jsx(icons.AlertTriangle, { className: 'shrink-0 size-3.5' }),
         label: 'blocked',
         tone: RED
@@ -1085,6 +1137,8 @@ function WorkerStrip({ ctx }) {
         ctx,
         count: groups.waiting,
         group: 'waiting',
+        multi,
+        split: byBoard(boards, 'waiting'),
         icon: jsx(icons.Clock, { className: 'shrink-0 size-3.5', style: { color: QUIET_COLOR } }),
         label: 'waiting',
         tone: QUIET_COLOR
@@ -1100,6 +1154,8 @@ function WorkerStrip({ ctx }) {
         ctx,
         count: groups.review,
         group: 'review',
+        multi,
+        split: byBoard(boards, 'review'),
         icon: jsx(icons.Eye, { className: 'shrink-0 size-3', style: { color: LABEL_COLOR } }),
         label: 'review',
         tone: QUIET_COLOR
@@ -1115,9 +1171,54 @@ function WorkerStrip({ ctx }) {
         ctx,
         count: groups.doneToday,
         group: 'done_today',
+        multi,
+        split: byBoard(boards, 'doneToday'),
         icon: jsx(icons.CheckCircle2, { className: 'shrink-0 size-3', style: { color: LABEL_COLOR } }),
         label: 'done today',
         tone: QUIET_COLOR
+      })
+    )
+  }
+
+  // A board that could not be read is never shown as an empty one.
+  if (unreadable.length > 0) {
+    items.push(
+      jsx('button', {
+        'aria-label': `${plural(unreadable.length, 'board')} could not be read and is left out of the counts: ${unreadable.join(', ')}`,
+        className: ITEM_CLASS,
+        key: 'unreadable',
+        onClick: () => {
+          try {
+            host.navigate(BOARD_PATH)
+          } catch {
+            // Bridge unavailable: never break the statusbar.
+          }
+        },
+        style: ITEM_STYLE,
+        title: `${plural(unreadable.length, 'board')} could not be read and is left out of the counts: ${unreadable.join(', ')}`,
+        type: 'button',
+        children: [
+          jsx(icons.AlertTriangle, { className: 'shrink-0 size-3.5', key: 'icon', style: { color: AMBER } }),
+          jsx('span', { className: 'tabular-nums font-medium', key: 'count', style: { color: AMBER }, children: String(unreadable.length) })
+        ]
+      })
+    )
+  }
+
+  // The boards setting matched no board: say so instead of reading as an idle board.
+  if (data && Array.isArray(data.boards) && data.boards.length === 0 && unreadable.length === 0) {
+    items.push(
+      jsx('button', {
+        'aria-label': 'No board matches the boards setting of this plugin',
+        className: ITEM_CLASS,
+        key: 'no-board',
+        style: ITEM_STYLE,
+        title: 'No board matches the boards setting of this plugin',
+        type: 'button',
+        children: [
+          jsx(icons.Users, { className: 'shrink-0 size-3.5', key: 'icon', style: { color: AMBER } }),
+          jsx('span', { key: 'text', style: { color: AMBER }, children: 'no board' })
+        ]
       })
     )
   }
@@ -1159,6 +1260,7 @@ function WorkerStrip({ ctx }) {
         card: hover !== null ? hover.card : null,
         ctx,
         key: 'card-panel',
+        multi,
         onClose: clearCard,
         onOpen: () => {
           closeHover()

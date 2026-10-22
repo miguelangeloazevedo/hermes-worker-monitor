@@ -194,11 +194,32 @@ def build_summary_response(
     groups: Mapping[str, Any],
     *,
     now: int,
+    boards: Iterable[Mapping[str, Any]] | None = None,
+    unreadable: Iterable[str] | None = None,
 ) -> dict[str, Any]:
-    """The one payload the desktop half reads."""
-    return {
+    """The one payload the desktop half reads.
+
+    ``groups`` is the sum over the boards counted. ``boards`` carries each
+    board's own groups under its name, for the popover's split, and
+    ``unreadable`` names the boards that could not be read, so the footer never
+    reads a board it failed to open as an empty one. Both keys are left out
+    when not given.
+    """
+    response: dict[str, Any] = {
         "generated_at": int(now),
         "board": {"path": BOARD_PATH},
         "groups": {key: int(value) for key, value in groups.items()},
         "workers": summarize_workers(tasks, activity_by_card, now=now),
     }
+    if boards is not None:
+        response["boards"] = [
+            {
+                "slug": str(board["slug"]),
+                "name": str(board.get("name") or board["slug"]),
+                "groups": {key: int(value) for key, value in board["groups"].items()},
+            }
+            for board in boards
+        ]
+    if unreadable:
+        response["unreadable"] = [str(slug) for slug in unreadable]
+    return response

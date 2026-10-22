@@ -1,7 +1,7 @@
 name: hermes-worker-monitor
 label: Hermes Worker Monitor
-version: 0.2.2
-description: Kanban board groups and worker health in the Hermes Desktop footer. Blocked cards first, live running state, hover a count for the cards behind it, one click to the board. Worker-only fork of hermes-monitor; no credentials and no network.
+version: 0.3.0
+description: Kanban board groups and worker health in the Hermes Desktop footer, summed over every board or the boards you choose. Blocked cards first, live running state, hover a count for the cards behind it, one click to the board. Worker-only fork of hermes-monitor; no credentials and no network.
 author: djmango (fork of hermes-monitor by mr-3mm3, MIT)
 manifest_version: 2
 license: MIT
@@ -13,3 +13,8 @@ provides_tools: []
 provides_hooks: []
 provides_middleware: []
 requires_env: []
+config_schema:
+  boards:
+    type: list
+    default: []
+    description: "Board slugs to count in the footer, for example [\"work\", \"research\"]. Empty counts every board that is not archived. The slugs are the ones `hermes kanban boards list` shows."

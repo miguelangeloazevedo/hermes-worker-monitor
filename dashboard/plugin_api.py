@@ -4,7 +4,8 @@ Three read-only routes. ``/summary`` is the one payload the footer strip reads:
 the Kanban group counts and the health of the running workers. ``/cards``
 returns the cards behind ONE group, for the popover a count opens. ``/card``
 returns ONE card in full, for the preview a hovered card row opens. All three
-open the local Kanban and worker session databases read-only. This fork reads no
+cover every live Kanban board, or the boards the user chose in the plugin
+settings, and open the local Kanban and worker session databases read-only. This fork reads no
 credentials, makes no network calls, and writes nothing.
 
 The card routes are the only ones that carry card text, and each answers for the
@@ -24,6 +25,7 @@ import json
 import os
 import sqlite3
 import time
+from collections.abc import Mapping
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Callable
@@ -63,6 +65,9 @@ except ImportError:  # Loaded by file path by the Hermes plugin loader: no packa
 
 router = APIRouter()
 CACHE_TTL_S = 300
+
+PLUGIN_ID = "hermes-worker-monitor"
+DEFAULT_BOARD = "default"
 
 # Assignee values that mean "the default profile", whose sessions live in the
 # root store rather than under ``profiles/``.
@@ -118,15 +123,15 @@ def _task_columns(connection: sqlite3.Connection) -> set[str]:
     return {str(row[1]) for row in connection.execute("PRAGMA table_info(tasks)").fetchall()}
 
 
-def _load_status_counts() -> dict[str, int]:
-    with closing(_readonly_connection(_kanban_database())) as connection:
+def _load_status_counts(path: Path | None = None) -> dict[str, int]:
+    with closing(_readonly_connection(path or _kanban_database())) as connection:
         rows = connection.execute("SELECT status, COUNT(*) FROM tasks GROUP BY status").fetchall()
     return {str(status): int(total) for status, total in rows}
 
 
-def _load_blocked_kinds() -> dict[str, int]:
+def _load_blocked_kinds(path: Path | None = None) -> dict[str, int]:
     """Blocked cards by reason. An older board without the column has none."""
-    with closing(_readonly_connection(_kanban_database())) as connection:
+    with closing(_readonly_connection(path or _kanban_database())) as connection:
         if "block_kind" not in _task_columns(connection):
             return {}
         rows = connection.execute(
@@ -143,8 +148,8 @@ def _local_day_start(now: float | None = None) -> int:
                             moment.tm_wday, moment.tm_yday, moment.tm_isdst)))
 
 
-def _load_done_today(now: float | None = None) -> int:
-    with closing(_readonly_connection(_kanban_database())) as connection:
+def _load_done_today(now: float | None = None, path: Path | None = None) -> int:
+    with closing(_readonly_connection(path or _kanban_database())) as connection:
         if "completed_at" not in _task_columns(connection):
             return 0
         row = connection.execute(
@@ -154,8 +159,8 @@ def _load_done_today(now: float | None = None) -> int:
     return int(row[0]) if row else 0
 
 
-def _load_running_tasks() -> list[dict[str, Any]]:
-    with closing(_readonly_connection(_kanban_database())) as connection:
+def _load_running_tasks(path: Path | None = None) -> list[dict[str, Any]]:
+    with closing(_readonly_connection(path or _kanban_database())) as connection:
         available = {str(row[1]) for row in connection.execute("PRAGMA table_info(tasks)").fetchall()}
         # ``last_heartbeat_at`` is the dispatcher's own liveness signal, and the
         # board's health rule reads it (see workers.card_state). An older board
@@ -166,6 +171,76 @@ def _load_running_tasks() -> list[dict[str, Any]]:
             ("running",),
         ).fetchall()
     return [dict(zip(wanted, row)) for row in rows]
+
+
+# -- which boards are counted ---------------------------------------------------
+
+def _host_board_catalog() -> list[dict[str, Any]] | None:
+    """The host's own board list (names, archived flag, pinned paths), or None.
+
+    None means the host helpers are not importable, so the caller scans the
+    board directories itself. Archived boards are never listed.
+    """
+    try:
+        from hermes_cli import kanban_db, kanban_db_boards
+
+        boards = []
+        for meta in kanban_db_boards.list_boards(include_archived=False):
+            slug = str(meta.get("slug") or "")
+            if slug:
+                boards.append({"slug": slug, "name": str(meta.get("name") or slug),
+                               "path": Path(kanban_db.kanban_db_path(slug))})
+        return boards or None
+    except Exception:  # Any host change or import failure: fall back to the directory scan.
+        return None
+
+
+def _scan_boards() -> list[dict[str, Any]]:
+    """Every live board found on disk: the default board, then ``kanban/boards/<slug>/``."""
+    override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
+    root = Path(override).expanduser() if override else _hermes_home()
+    boards = [{"slug": DEFAULT_BOARD, "name": "Default", "path": root / "kanban.db"}]
+    directory = root / "kanban" / "boards"
+    if directory.is_dir():
+        for child in sorted(directory.iterdir(), key=lambda entry: entry.name.lower()):
+            # ``_archived`` and dot directories are not boards.
+            if child.name.startswith(("_", ".")) or not (child / "kanban.db").is_file():
+                continue
+            boards.append({"slug": child.name, "name": child.name, "path": child / "kanban.db"})
+    return boards
+
+
+def _selected_slugs() -> list[str] | None:
+    """The board slugs the user chose in the plugin settings, or None for every board.
+
+    Reads only this plugin's own ``plugins.entries.<id>.settings.boards`` entry.
+    An empty list, a missing key and an unreadable config all mean every board.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.plugins_state import _plugin_settings_entry
+
+        entry = _plugin_settings_entry(load_config_readonly() or {}, PLUGIN_ID)
+    except Exception:
+        return None
+    settings = entry.get("settings") if entry is not None else None
+    value = settings.get("boards") if isinstance(settings, Mapping) else None
+    if isinstance(value, str):
+        value = value.replace(",", " ").split()
+    if not isinstance(value, (list, tuple)):
+        return None
+    slugs = [str(item).strip() for item in value if str(item).strip()]
+    return slugs or None
+
+
+def _active_boards() -> list[dict[str, Any]]:
+    """The boards to count: the user's choice if there is one, else every live board."""
+    boards = _host_board_catalog() or _scan_boards()
+    chosen = _selected_slugs()
+    if chosen is None:
+        return boards
+    wanted = set(chosen)
+    return [board for board in boards if board["slug"] in wanted]
 
 
 # -- one group's cards --------------------------------------------------------
@@ -243,9 +318,9 @@ def _group_where(group: str, columns: set[str], *, day_start: int) -> tuple[str,
     return (f"WHERE status IN ({marks})", list(statuses))
 
 
-def _load_group_cards(group: str, limit: int, *, day_start: int) -> list[dict[str, Any]]:
-    """Up to ``limit`` cards of one group, most relevant first."""
-    with closing(_readonly_connection(_kanban_database())) as connection:
+def _load_group_cards(group: str, limit: int, *, day_start: int, path: Path | None = None) -> list[dict[str, Any]]:
+    """Up to ``limit`` cards of one group on one board, most relevant first."""
+    with closing(_readonly_connection(path or _kanban_database())) as connection:
         columns = _task_columns(connection)
         where, params = _group_where(group, columns, day_start=day_start)
         fields = [field for field in _CARD_FIELDS if field in columns]
@@ -273,25 +348,66 @@ def _load_group_cards(group: str, limit: int, *, day_start: int) -> list[dict[st
     return cards
 
 
+def _card_sort_key(group: str, card: dict[str, Any]) -> tuple:
+    """The same order one board's query uses, applied across boards."""
+    def number(field: str) -> float:
+        value = card.get(field)
+        return float(value) if isinstance(value, (int, float)) else 0.0
+
+    if group == "running":
+        return (number("started_at"), str(card.get("id") or ""))
+    if group == "done_today":
+        return (-number("completed_at"), str(card.get("id") or ""))
+    return (-number("priority"), number("created_at"), str(card.get("id") or ""))
+
+
 def _build_cards_payload(group: str, limit: int) -> dict[str, Any]:
-    """One group's cards, plus that group's real total from the same fold the
-    footer strip counts with, so a capped list never reads as the whole board."""
+    """One group's cards over the counted boards, plus that group's real total from
+    the same fold the footer strip counts with, so a capped list never reads as
+    the whole board. Each card names its board."""
     now = int(time.time())
-    cards = _load_group_cards(group, limit, day_start=_local_day_start(now))
+    day_start = _local_day_start(now)
+    cards: list[dict[str, Any]] = []
+    total = 0
+    unreadable: list[str] = []
+    last_error: Exception | None = None
+    boards = _active_boards()
+    for board in boards:
+        path = board["path"]
+        try:
+            found = _load_group_cards(group, limit, day_start=day_start, path=path)
+            counted = normalize_groups(
+                _load_status_counts(path), _load_blocked_kinds(path), done_today=_load_done_today(now, path)
+            )
+        except (sqlite3.Error, OSError) as error:
+            unreadable.append(board["slug"])
+            last_error = error
+            continue
+        total += int(counted.get(group) or 0)
+        for card in found:
+            card["board"] = board["slug"]
+            card["board_name"] = board["name"]
+        cards.extend(found)
+    if boards and len(unreadable) == len(boards) and last_error is not None:
+        raise last_error
+    cards.sort(key=lambda card: _card_sort_key(group, card))
+    cards = cards[: int(limit)]
     if group == "running":
         # The chip colors itself by the worst live worker, so each row carries
         # its own state instead of one flat color for the group.
         for card in cards:
             card["worker_state"] = card_state(_load_tool_events(card), now=now)
-    totals = normalize_groups(_load_status_counts(), _load_blocked_kinds(), done_today=_load_done_today(now))
-    return {
+    payload = {
         "generated_at": now,
         "group": group,
         "limit": int(limit),
         "shown": len(cards),
-        "total": int(totals.get(group) or 0),
+        "total": total,
         "cards": cards,
     }
+    if unreadable:
+        payload["unreadable"] = unreadable
+    return payload
 
 
 # -- one card's detail --------------------------------------------------------
@@ -347,11 +463,11 @@ def _table_names(connection: sqlite3.Connection) -> set[str]:
     return {str(row[0]) for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
 
 
-def _load_card_payload(card_id: str) -> dict[str, Any] | None:
+def _load_card_payload(card_id: str, path: Path | None = None) -> dict[str, Any] | None:
     """One card in full, plus its newest run, its recent comments and its
     attachments. The board's own drawer shows the same three, and a hovered row
     opens this instead of leaving the page."""
-    with closing(_readonly_connection(_kanban_database())) as connection:
+    with closing(_readonly_connection(path or _kanban_database())) as connection:
         tables = _table_names(connection)
         columns = _task_columns(connection)
         fields = [field for field in _CARD_DETAIL_FIELDS if field in columns]
@@ -424,6 +540,23 @@ def _load_card_payload(card_id: str) -> dict[str, Any] | None:
         "comments": comments,
         "attachments": attachments,
     }
+
+
+def _find_card_payload(card_id: str) -> dict[str, Any] | None:
+    """The card, found on the first counted board that holds it, tagged with that board.
+
+    Card ids are random, so the same id on two boards is not expected. A board
+    that cannot be read is skipped, like a board that has no such card.
+    """
+    for board in _active_boards():
+        try:
+            payload = _load_card_payload(card_id, board["path"])
+        except (sqlite3.Error, OSError):
+            continue
+        if payload is not None:
+            payload["board"] = {"slug": board["slug"], "name": board["name"]}
+            return payload
+    return None
 
 
 def _profile_databases(assignee: str) -> list[Path]:
@@ -499,10 +632,34 @@ def _load_tool_events(task: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _build_summary_payload() -> dict[str, Any]:
     now = int(time.time())
-    tasks = _load_running_tasks()
+    totals = {key: 0 for key in GROUP_ORDER}
+    per_board: list[dict[str, Any]] = []
+    unreadable: list[str] = []
+    tasks: list[dict[str, Any]] = []
+    last_error: Exception | None = None
+    boards = _active_boards()
+    for board in boards:
+        path = board["path"]
+        try:
+            counts = _load_status_counts(path)
+            kinds = _load_blocked_kinds(path)
+            done_today = _load_done_today(now, path)
+            running = _load_running_tasks(path)
+        except (sqlite3.Error, OSError) as error:
+            # One unreadable board must not hide the others, and must not read as zero.
+            unreadable.append(board["slug"])
+            last_error = error
+            continue
+        groups = normalize_groups(counts, kinds, done_today=done_today)
+        for key in totals:
+            totals[key] += int(groups.get(key) or 0)
+        per_board.append({"slug": board["slug"], "name": board["name"], "groups": groups})
+        # Card ids are only unique within one board.
+        tasks.extend({**task, "id": f"{board['slug']}:{task['id']}"} for task in running)
+    if boards and not per_board and last_error is not None:
+        raise last_error
     activity = {str(task["id"]): _load_tool_events(task) for task in tasks}
-    groups = normalize_groups(_load_status_counts(), _load_blocked_kinds(), done_today=_load_done_today(now))
-    return build_summary_response(tasks, activity, groups, now=now)
+    return build_summary_response(tasks, activity, totals, now=now, boards=per_board, unreadable=unreadable)
 
 
 async def _cached(cache: TTLCache, lock: asyncio.Lock, fresh: int, builder: Callable[[], Any]) -> dict[str, Any]:
@@ -550,7 +707,7 @@ async def get_card(id: str = Query(..., min_length=1, max_length=200)) -> dict[s
     Also uncached: it answers a hover, and the drawer it stands in for would
     never show a stale body either.
     """
-    payload = await asyncio.to_thread(_load_card_payload, id)
+    payload = await asyncio.to_thread(_find_card_payload, id)
     if payload is None:
         raise HTTPException(status_code=404, detail="No such card")
     return payload

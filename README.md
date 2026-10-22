@@ -14,6 +14,7 @@ One compact strip on the right side of the Desktop footer:
 - Only one Kanban readout in the footer. The app's own Kanban counter sits beside the strip and reports the same board (a project glyph, running plus ready). It cannot be unregistered or hidden by a plugin, so the strip hides it with one scoped stylesheet rule. Remove `HIDE_CORE_COUNTER_CSS` to bring it back.
 - No divider mark: the strip is a plain sequence now, and a lone dash beside the app's own counter read as part of it.
 - The running count carries a state dot: green for active, amber when a card stalls, red when a worker loops. The dot color follows the worst running card, so a stall or a loop is visible without opening anything.
+- The counts add up every live Kanban board, or only the boards you choose: see [Choosing the boards](#choosing-the-boards).
 - Hover any count for the cards behind it: a list of that group's cards, each row with the card's dot, title, id, and age. The rows are the app's own list row from the Desktop plugin SDK, so the footer and the Kanban page cannot drift apart.
 - Hover a card in that list for the whole card in a centered overlay over the app, the way a fuzzy finder floats in the middle of the screen: the title and its pills, the fields, the description as markdown, the newest run, the recent comments, and the attachments. It is the same set the board's own drawer shows, built from the app's own dialog shell, panel parts and chat markdown renderer. Read-only: the actions stay one click away in the drawer, because a desktop plugin cannot reach the Kanban plugin's own API.
 - Nothing needs a precise pointer. The card opens after a short rest on a row, so sweeping the list does not flash overlays, and both layers stay up while the pointer is on any of the strip, the list, or the overlay. A pointer crossing the gap to the centered overlay is mid journey, not gone, and the grace is 1000ms. Cards are fetched while the list is on screen, so the overlay paints from cache instead of opening with a loading line.
@@ -56,7 +57,7 @@ The comparison is against the fork at 0.2.1. The hover preview and `GET /card` a
 
 ## Trust surface
 
-- No credential is read, from any source.
+- No credential is read, from any source. To find its own `boards` setting the backend loads Hermes' config file read-only and takes this plugin's entry from it; nothing else in that file is used.
 - No network call is made. Zero egress.
 - No file is written.
 - No install-time code: no `preinstall`, no `postinstall`, no setup script, and no third-party dependency. The Python half imports only the standard library and the `fastapi` that Hermes already provides.
@@ -91,6 +92,26 @@ hermes plugins enable hermes-worker-monitor
 
 Add `hermes-worker-monitor` to `plugins.enabled` if the enable command is unavailable. Restart the gateway so the backend route is loaded, then quit and reopen Hermes Desktop so the footer item appears.
 
+## Choosing the boards
+
+By default the strip counts every live board: the `default` board plus each board under `kanban/boards/`. Archived boards are never counted. To count only some of them, set the `boards` setting to a list of board slugs, the ones `hermes kanban boards list` shows:
+
+```sh
+hermes config set plugins.entries.hermes-worker-monitor.settings.boards '["work", "research"]'
+```
+
+The same setting appears in the plugin's settings form in Desktop. An empty list, or no setting, means every board. A slug that matches no board is ignored, and a list that matches nothing shows `no board` instead of falling back to all boards.
+
+With more than one board counted:
+
+- each popover opens with `By board: work 34, default 7` (the four biggest, then `N more`);
+- each card row starts with its board's name, and the card overlay carries a board pill;
+- a board whose database cannot be read is left out and the footer says so with an amber `unreadable` count, so a failed board is never shown as an empty one. If no board can be read, the footer shows `n/a`.
+
+Opening a card on the Kanban page works as before, but the page shows one board at a time and the strip cannot switch it. A card on another board opens the board page, and its drawer opens once you switch the page to that board.
+
+Upgrading from 0.2.x: 0.2 counted the `default` board only. Set `boards` to `["default"]` to keep that.
+
 ## Worker health states
 
 The backend reads running Kanban cards and the local activity of their workers:
@@ -105,7 +126,7 @@ Activity comes from the worker's own session store. A named profile keeps its se
 
 ## Privacy
 
-The backend opens the local databases in read-only mode and writes nothing. `GET /summary` returns counts only. `GET /cards` returns the cards of the one group that was asked for, and `GET /card` returns the one card a row was hovered on, description included. Both card routes answer only to the app that asked, over the same authenticated channel as every other route, and they are the only ones that carry card text. Message content and tool arguments never leave the backend, and arguments are represented by hashes for the stall and loop test.
+The backend opens the local databases in read-only mode and writes nothing. `GET /summary` returns counts only, plus each counted board's name and its share of them. `GET /cards` returns the cards of the one group that was asked for, and `GET /card` returns the one card a row was hovered on, description included. Both card routes answer only to the app that asked, over the same authenticated channel as every other route, and they are the only ones that carry card text. Message content and tool arguments never leave the backend, and arguments are represented by hashes for the stall and loop test.
 
 ## Development
 

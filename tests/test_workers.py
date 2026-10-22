@@ -175,6 +175,20 @@ def test_every_group_the_strip_draws_is_reachable_by_the_classification():
     assert seen == set(GROUP_ORDER)
 
 
+def test_response_adds_board_names_and_unreadable_only_when_given():
+    groups = normalize_groups({"running": 1, "blocked": 2}, {}, done_today=0)
+    plain = build_summary_response([], {}, groups, now=NOW)
+    assert "boards" not in plain and "unreadable" not in plain
+
+    result = build_summary_response(
+        [], {}, groups, now=NOW,
+        boards=[{"slug": "alpha", "name": "Alpha team", "groups": groups}],
+        unreadable=["beta"],
+    )
+    assert result["boards"] == [{"slug": "alpha", "name": "Alpha team", "groups": dict(groups)}]
+    assert result["unreadable"] == ["beta"]
+
+
 def load_tests(loader, tests, pattern):
     suite = unittest.TestSuite()
     for name, value in globals().items():

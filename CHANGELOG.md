@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.0
+
+- The counts, the card lists and the card preview now cover every live Kanban board instead of the `default` board only. Boards come from the host's own board list when it is available, and from a scan of `<root>/kanban/boards/` otherwise (honouring `HERMES_KANBAN_HOME`). Archived boards and the `_archived` and dot directories are skipped.
+- New `boards` setting (`plugins.entries.hermes-worker-monitor.settings.boards`, declared in `config_schema` so it shows in the settings form): a list of board slugs to count. Empty or missing means every board. Unknown slugs are ignored. A list that matches no board counts nothing and the strip says `no board`.
+- Each popover opens with the split by board, for example `By board: work 34, default 7`: the four biggest, then `N more`. It shows when more than one board is counted.
+- Card rows start with their board's name and the card overlay carries a board pill, both only when more than one board is counted. `GET /cards` merges the boards in the group's own order, tags each card with `board` and `board_name`, and reports the real total across boards. `GET /card` searches the counted boards for the id and names the board it found it on.
+- A board that cannot be opened is named in an amber `unreadable` item and left out of the counts. It is never read as empty. If no board can be read the route fails, as before.
+- Card ids are only unique within a board, so worker health is keyed by board and card.
+- The summary payload keeps its existing keys and gains `boards` (slug, name, per-board groups) and, only when needed, `unreadable`.
+- Behaviour change: 0.2.x counted the `default` board only. Set `boards` to `["default"]` to keep that.
+- Known limit: the Kanban page shows one board at a time and has no deep link, so a card on another board opens the board page and not its drawer until you switch the page to that board.
+- Tests: 67. The new ones cover the scan, the override, the combined and per-board counts, selection, an empty selection, unreadable boards, the host list, the settings read, card-id collisions, and the card list and card preview across boards. Each rule was checked by breaking it once.
+
 ## 0.2.2
 
 - Clicking a card in a list now opens THAT card, not just the board. The board has no deep link for a single card (its drawer opens from local state, a card carries no id in the DOM, and the SDK has no hook for it), so the strip does what a person does and then checks its own work: click a card whose text starts with the title, then look for the card's short id on the page, which only its drawer shows. A wrong click (the page has hundreds of draggable nodes, chat messages quoting titles among them) costs one attempt and the loop tries the next candidate. Measured live: a row clicked in a 19 row list opened that card's drawer within 1 second.

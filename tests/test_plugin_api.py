@@ -4,7 +4,9 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -12,6 +14,15 @@ from unittest.mock import patch
 from fastapi import HTTPException
 
 from dashboard import plugin_api
+
+# The tests build their own boards under a temporary HERMES_HOME. The host's board
+# list and the plugin settings must never leak in from the machine the tests run
+# on, so both are switched off here; the tests that exercise them put the real
+# functions back explicitly.
+_REAL_HOST_CATALOG = plugin_api._host_board_catalog
+_REAL_SELECTED_SLUGS = plugin_api._selected_slugs
+plugin_api._host_board_catalog = lambda: None
+plugin_api._selected_slugs = lambda: None
 
 NOW = 1_700_000_000
 CANARY = "canary-value-must-not-appear"
@@ -478,6 +489,308 @@ def test_a_row_click_opens_that_card_on_the_board():
     assert "onClick: () => onOpen(detail.card)" in source
 
 
+# -- more than one board ------------------------------------------------------
+
+
+def _root_with_boards(root: Path) -> None:
+    """A default board plus two named boards, an archived one and a junk directory."""
+    _board(root / "kanban.db", [
+        ("t_a", "A", "running", "default", NOW),
+        ("t_b", "B", "blocked", "default", NOW, None, "needs_input"),
+    ])
+    for slug, rows in {
+        "alpha": [("t_a2", "Same title elsewhere", "running", "default", NOW),
+                  ("t_c", "C", "blocked", "default", NOW, None, "capability"),
+                  ("t_d", "D", "blocked", "default", NOW, None, "dependency")],
+        "beta": [("t_e", "E", "todo", "default", NOW), ("t_f", "F", "review", "default", NOW)],
+    }.items():
+        (root / "kanban" / "boards" / slug).mkdir(parents=True)
+        _board(root / "kanban" / "boards" / slug / "kanban.db", rows)
+    # Directories that hold a database but are not boards: the archive and a dot directory.
+    for junk in ("_archived", ".hidden"):
+        (root / "kanban" / "boards" / junk).mkdir(parents=True)
+        _board(root / "kanban" / "boards" / junk / "kanban.db",
+               [("t_x", "X", "blocked", "default", NOW, None, "needs_input")])
+    (root / "kanban" / "boards" / "empty-dir").mkdir(parents=True)
+
+
+def _payload(root: Path, *, selected=None, events=lambda task: []) -> dict:
+    with patch.dict(os.environ, {"HERMES_HOME": str(root)}, clear=True), \
+            patch.object(plugin_api, "_selected_slugs", lambda: selected), \
+            patch.object(plugin_api, "_load_tool_events", events):
+        return plugin_api._build_summary_payload()
+
+
+def test_scan_lists_the_default_board_then_live_named_boards_only():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _root_with_boards(root)
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}, clear=True):
+            boards = plugin_api._scan_boards()
+
+    assert [board["slug"] for board in boards] == ["default", "alpha", "beta"]
+    assert boards[0]["path"] == root / "kanban.db"
+
+
+def test_scan_follows_the_kanban_home_override():
+    with tempfile.TemporaryDirectory() as directory:
+        shared = Path(directory) / "shared"
+        shared.mkdir()
+        _root_with_boards(shared)
+        with patch.dict(os.environ, {"HERMES_HOME": str(Path(directory) / "profiles" / "p"),
+                                     "HERMES_KANBAN_HOME": str(shared)}, clear=True):
+            boards = plugin_api._scan_boards()
+
+    assert [board["slug"] for board in boards] == ["default", "alpha", "beta"]
+
+
+def test_every_board_is_counted_by_default_and_the_split_names_each_board():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _root_with_boards(root)
+        payload = _payload(root)
+
+    assert payload["groups"] == {"blocked": 2, "waiting": 1, "running": 2, "queued": 1,
+                                 "scheduled": 0, "review": 1, "done_today": 0}
+    assert [board["slug"] for board in payload["boards"]] == ["default", "alpha", "beta"]
+    by_slug = {board["slug"]: board["groups"] for board in payload["boards"]}
+    assert by_slug["default"]["blocked"] == 1 and by_slug["alpha"]["blocked"] == 1
+    assert by_slug["alpha"]["waiting"] == 1 and by_slug["beta"]["queued"] == 1
+    # The archived board's blocked card is not counted.
+    assert sum(board["blocked"] for board in by_slug.values()) == payload["groups"]["blocked"]
+    assert payload["workers"]["total"] == 2
+    assert "unreadable" not in payload
+
+
+def test_a_card_id_shared_by_two_boards_keeps_its_own_worker_state():
+    import time
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _root_with_boards(root)
+        # Give alpha's running card the same id as the default board's.
+        with sqlite3.connect(root / "kanban" / "boards" / "alpha" / "kanban.db") as connection:
+            connection.execute("UPDATE tasks SET id = 't_a' WHERE id = 't_a2'")
+        now = time.time()
+
+        def events(task):
+            # The default board's card went quiet; the same id on alpha is live.
+            age = 1000 if task["id"].startswith("default:") else 0
+            return [{"tool_name": "terminal", "arguments_hash": str(index), "timestamp": now - age}
+                    for index in range(3)]
+
+        workers = _payload(root, events=events)["workers"]
+
+    assert (workers["total"], workers["active"], workers["stalled"]) == (2, 1, 1)
+
+
+def test_the_chosen_boards_are_the_only_ones_counted_and_unknown_slugs_are_ignored():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _root_with_boards(root)
+        payload = _payload(root, selected=["beta", "nonexistent"])
+
+    assert [board["slug"] for board in payload["boards"]] == ["beta"]
+    assert payload["groups"]["queued"] == 1 and payload["groups"]["blocked"] == 0
+    assert payload["workers"]["total"] == 0
+
+
+def test_a_choice_that_matches_no_board_counts_nothing_instead_of_falling_back_to_all():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _root_with_boards(root)
+        payload = _payload(root, selected=["nonexistent"])
+
+    assert payload["boards"] == []
+    assert set(payload["groups"].values()) == {0}
+
+
+def test_an_unreadable_board_is_named_and_the_rest_still_count():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _root_with_boards(root)
+        (root / "kanban" / "boards" / "beta" / "kanban.db").write_bytes(b"this is not a database" * 50)
+        payload = _payload(root)
+
+    assert payload["unreadable"] == ["beta"]
+    assert [board["slug"] for board in payload["boards"]] == ["default", "alpha"]
+    assert payload["groups"]["blocked"] == 2
+
+
+def test_when_no_board_can_be_read_the_route_fails_instead_of_reporting_zero():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        try:
+            _payload(root)
+        except OSError:
+            return
+    raise AssertionError("an unreadable board set was reported as an empty one")
+
+
+def _fake_host(config: dict) -> dict:
+    """Stand-ins for the host modules the settings read imports."""
+    hermes_cli = types.ModuleType("hermes_cli")
+    cfg = types.ModuleType("hermes_cli.config")
+    cfg.load_config_readonly = lambda: config
+    state = types.ModuleType("hermes_cli.plugins_state")
+    state._plugin_settings_entry = lambda conf, plugin_id: (
+        conf.get("plugins", {}).get("entries", {}).get(plugin_id))
+    return {"hermes_cli": hermes_cli, "hermes_cli.config": cfg, "hermes_cli.plugins_state": state}
+
+
+def _config(boards) -> dict:
+    return {"plugins": {"entries": {plugin_api.PLUGIN_ID: {"settings": {"boards": boards}}}}}
+
+
+def test_the_boards_setting_is_read_from_this_plugins_own_entry_only():
+    with patch.dict(sys.modules, _fake_host(_config(["alpha", " beta ", ""]))):
+        assert _REAL_SELECTED_SLUGS() == ["alpha", "beta"]
+    with patch.dict(sys.modules, _fake_host(_config("alpha, beta"))):
+        assert _REAL_SELECTED_SLUGS() == ["alpha", "beta"]
+    other = {"plugins": {"entries": {"some-other-plugin": {"settings": {"boards": ["alpha"]}}}}}
+    with patch.dict(sys.modules, _fake_host(other)):
+        assert _REAL_SELECTED_SLUGS() is None
+
+
+def test_an_empty_missing_or_malformed_boards_setting_means_every_board():
+    for value in ([], None, 7, {"alpha": True}):
+        with patch.dict(sys.modules, _fake_host(_config(value))):
+            assert _REAL_SELECTED_SLUGS() is None
+    with patch.dict(sys.modules, _fake_host({})):
+        assert _REAL_SELECTED_SLUGS() is None
+    # Host helpers that cannot be imported at all: every board.
+    with patch.dict(sys.modules, {"hermes_cli": None}):
+        assert _REAL_SELECTED_SLUGS() is None
+
+
+def test_the_host_board_list_is_preferred_and_its_names_are_used():
+    hermes_cli = types.ModuleType("hermes_cli")
+    kanban_db = types.ModuleType("hermes_cli.kanban_db")
+    kanban_db.kanban_db_path = lambda slug: Path("/tmp") / slug / "kanban.db"
+    boards = types.ModuleType("hermes_cli.kanban_db_boards")
+    boards.list_boards = lambda include_archived=True: (
+        [{"slug": "default", "name": "Main"}, {"slug": "alpha", "name": "Alpha team"}]
+        if not include_archived else [])
+    hermes_cli.kanban_db = kanban_db
+    hermes_cli.kanban_db_boards = boards
+    modules = {"hermes_cli": hermes_cli, "hermes_cli.kanban_db": kanban_db,
+               "hermes_cli.kanban_db_boards": boards}
+    with patch.dict(sys.modules, modules):
+        catalog = _REAL_HOST_CATALOG()
+
+    assert [(board["slug"], board["name"]) for board in catalog] == [("default", "Main"), ("alpha", "Alpha team")]
+    assert catalog[1]["path"] == Path("/tmp/alpha/kanban.db")
+
+
+def test_the_summary_carries_board_names_and_counts_but_no_card_text():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _root_with_boards(root)
+        with sqlite3.connect(root / "kanban" / "boards" / "alpha" / "kanban.db") as connection:
+            connection.execute(
+                "INSERT INTO tasks (id, title, status, assignee, started_at, completed_at, block_kind) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("t_canary", CANARY, "blocked", CANARY, NOW, None, "needs_input"),
+            )
+        text = json.dumps(_payload(root))
+
+    assert CANARY not in text
+    assert "t_canary" not in text and "Same title elsewhere" not in text
+
+
+def _cards(root: Path, group: str, limit: int = 25, *, selected=None) -> dict:
+    with patch.dict(os.environ, {"HERMES_HOME": str(root)}, clear=True), \
+            patch.object(plugin_api, "_selected_slugs", lambda: selected), \
+            patch.object(plugin_api, "_load_tool_events", lambda task: []):
+        return plugin_api._build_cards_payload(group, limit)
+
+
+def test_the_card_list_spans_the_boards_names_each_one_and_matches_the_count():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _root_with_boards(root)
+        summary = _payload(root)
+        for group in ("blocked", "waiting", "running", "queued", "review"):
+            cards = _cards(root, group)
+            assert cards["total"] == summary["groups"][group], group
+            assert len(cards["cards"]) == cards["total"], group
+        blocked = _cards(root, "blocked")["cards"]
+
+    assert sorted((card["id"], card["board"]) for card in blocked) == [("t_b", "default"), ("t_c", "alpha")]
+    assert {card["board_name"] for card in blocked} == {"Default", "alpha"}
+
+
+def test_a_capped_card_list_over_several_boards_keeps_the_real_total():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _root_with_boards(root)
+        capped = _cards(root, "running", 1)
+
+    assert capped["shown"] == 1 and capped["total"] == 2
+
+
+def test_a_capped_card_list_over_several_boards_keeps_the_groups_own_order():
+    """The longest-running card leads, wherever it lives; the newest finish leads for done today."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _root_with_boards(root)
+        day = plugin_api._local_day_start()
+        with sqlite3.connect(root / "kanban" / "boards" / "alpha" / "kanban.db") as connection:
+            connection.execute("UPDATE tasks SET started_at = ? WHERE id = 't_a2'", (NOW - 100,))
+            connection.execute("UPDATE tasks SET status = 'done', completed_at = ? WHERE id = 't_c'", (day + 50,))
+        with sqlite3.connect(root / "kanban.db") as connection:
+            connection.execute("UPDATE tasks SET status = 'done', completed_at = ? WHERE id = 't_b'", (day + 10,))
+        longest = _cards(root, "running", 1)["cards"]
+        newest = _cards(root, "done_today", 1)["cards"]
+
+    # The default board is listed first, so a list that was only concatenated would lead with t_a / t_b.
+    assert [card["id"] for card in longest] == ["t_a2"]
+    assert [card["id"] for card in newest] == ["t_c"]
+
+
+def test_the_card_list_follows_the_chosen_boards_and_reports_an_unreadable_one():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _root_with_boards(root)
+        only_alpha = _cards(root, "blocked", selected=["alpha"])
+        (root / "kanban" / "boards" / "beta" / "kanban.db").write_bytes(b"not a database" * 40)
+        with_broken = _cards(root, "blocked")
+
+    assert [card["id"] for card in only_alpha["cards"]] == ["t_c"]
+    assert with_broken["unreadable"] == ["beta"]
+    assert len(with_broken["cards"]) == 2
+
+
+def test_the_card_preview_finds_a_card_on_any_counted_board_and_names_it():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _root_with_boards(root)
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}, clear=True), \
+                patch.object(plugin_api, "_selected_slugs", lambda: None):
+            found = plugin_api._find_card_payload("t_c")
+            on_default = plugin_api._find_card_payload("t_b")
+            missing = plugin_api._find_card_payload("t_nope")
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}, clear=True), \
+                patch.object(plugin_api, "_selected_slugs", lambda: ["default"]):
+            not_chosen = plugin_api._find_card_payload("t_c")
+
+    assert found["board"] == {"slug": "alpha", "name": "alpha"}
+    assert on_default["board"]["slug"] == "default"
+    assert missing is None and not_chosen is None
+
+
+def test_the_card_route_asks_the_boards_not_just_the_default_one():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        _root_with_boards(root)
+        with patch.dict(os.environ, {"HERMES_HOME": str(root)}, clear=True), \
+                patch.object(plugin_api, "_selected_slugs", lambda: None):
+            payload = asyncio.run(plugin_api.get_card(id="t_e"))
+
+    assert payload["card"]["id"] == "t_e" and payload["board"]["slug"] == "beta"
+
+
+
 def test_no_em_dashes_in_shipped_sources():
     """House rule for this fork: no em dashes in code, docs, or UI copy."""
     root = Path(__file__).resolve().parent.parent
@@ -569,7 +882,8 @@ def test_the_card_list_carries_no_card_body_or_arguments():
             payload = plugin_api._build_cards_payload("blocked", 25)
 
     card = payload["cards"][0]
-    assert set(card) <= set(plugin_api._CARD_FIELDS)
+    # Every row also names its board (slug and display name), which is not card text.
+    assert set(card) <= set(plugin_api._CARD_FIELDS) | {"board", "board_name"}
     assert "body" not in card
     assert card["title"] == "Needs a person"
     assert card["block_kind"] == "needs_input"
