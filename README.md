@@ -108,7 +108,7 @@ With more than one board counted:
 - each card row starts with its board's name, and the card overlay carries a board pill;
 - a board whose database cannot be read is left out and the footer says so with an amber `unreadable` count, so a failed board is never shown as an empty one. If no board can be read, the footer shows `n/a`.
 
-Opening a card on the Kanban page works as before, but the page shows one board at a time and the strip cannot switch it. A card on another board opens the board page, and its drawer opens once you switch the page to that board.
+Clicking a card on another board opens it for you. The Kanban page shows one board at a time and keeps its choice out of the plugin SDK's reach, so the strip does what you would: it opens the page's board switcher, picks the card's board by name, then opens the card. It checks the switcher's label afterwards and never blocks the open: if the switcher or the board is not found, the page stays where it was. The page is left on the board it switched to, as if you had picked it.
 
 Upgrading from 0.2.x: 0.2 counted the `default` board only. Set `boards` to `["default"]` to keep that.
 

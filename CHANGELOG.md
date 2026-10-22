@@ -10,8 +10,8 @@
 - Card ids are only unique within a board, so worker health is keyed by board and card.
 - The summary payload keeps its existing keys and gains `boards` (slug, name, per-board groups) and, only when needed, `unreadable`.
 - Behaviour change: 0.2.x counted the `default` board only. Set `boards` to `["default"]` to keep that.
-- Known limit: the Kanban page shows one board at a time and has no deep link, so a card on another board opens the board page and not its drawer until you switch the page to that board.
-- Tests: 67. The new ones cover the scan, the override, the combined and per-board counts, selection, an empty selection, unreadable boards, the host list, the settings read, card-id collisions, and the card list and card preview across boards. Each rule was checked by breaking it once.
+- Clicking a card that lives on another board first switches the Kanban page to that board, by opening the page's board switcher with a pointer-down and picking the board by its exact name, then opens the card as before. A page without a switcher, or a board it cannot find, leaves the page where it was. The page stays on the board it switched to.
+- Tests: 68. The new ones cover the scan, the override, the combined and per-board counts, selection, an empty selection, unreadable boards, the host list, the settings read, card-id collisions, and the card list and card preview across boards. Each rule was checked by breaking it once.
 
 ## 0.2.2
 

@@ -398,6 +398,81 @@ const GROUPS = {
 
 const STATUS_TONE = { blocked: 'bad', cancelled: 'bad', done: 'good', running: 'good', review: 'warn' }
 
+// How long to wait for the board switcher and its menu to appear.
+const BOARD_SWITCH_TIMEOUT_MS = 2000
+
+const pause = ms => new Promise(resolve => setTimeout(resolve, ms))
+
+/** Polls `read` until it returns something, or `timeoutMs` passes. */
+async function until(read, timeoutMs) {
+  const end = Date.now() + timeoutMs
+  for (;;) {
+    const value = read()
+    if (value || Date.now() >= end) return value || null
+    await pause(60)
+  }
+}
+
+/**
+ * The Kanban page's board switcher: a menu button with the project glyph that is
+ * not in the statusbar (the app's own counter there carries the same glyph).
+ */
+function boardSwitcherTrigger() {
+  return (
+    Array.from(document.querySelectorAll('button[aria-haspopup="menu"]')).find(
+      node => !node.closest('[data-slot="statusbar"]') && node.querySelector('.codicon-project')
+    ) ?? null
+  )
+}
+
+function boardSwitcherLabel(trigger) {
+  const named = trigger.querySelector('span.truncate')?.textContent
+  const text = named ?? String(trigger.getAttribute('aria-label') ?? '').replace(/^[^:]*:\s*/, '')
+  return String(text).trim().toLowerCase()
+}
+
+/** A menu row reads "Name" plus the board's card count; the name is what is left of the digits. */
+function boardItemName(item) {
+  return String(item.textContent ?? '').replace(/\s*\d+\s*$/, '').trim().toLowerCase()
+}
+
+/**
+ * Make the Kanban page show the board a card lives on.
+ *
+ * The page keeps its selected board in state the plugin SDK cannot reach, so this
+ * does what a person does: open the board switcher and pick the board by name.
+ * It needs a pointer-down on the trigger (that is what the menu listens for), and
+ * it checks its own work by reading the switcher's label afterwards. It never
+ * throws and never blocks the card open: when the switcher or the board is not
+ * found, the page stays where it was and the card loop below simply finds nothing.
+ * The page is left on the board it switched to, as if the person had picked it.
+ */
+async function showBoardOf(card) {
+  const names = [card?.board_name, card?.board]
+    .map(name => String(name ?? '').trim().toLowerCase())
+    .filter(Boolean)
+  if (names.length === 0) return
+  try {
+    const trigger = await until(boardSwitcherTrigger, BOARD_SWITCH_TIMEOUT_MS)
+    if (!trigger || names.includes(boardSwitcherLabel(trigger))) return
+    trigger.dispatchEvent(
+      new PointerEvent('pointerdown', { bubbles: true, button: 0, cancelable: true, ctrlKey: false, pointerType: 'mouse' })
+    )
+    const item = await until(
+      () =>
+        Array.from(document.querySelectorAll('[role="menuitem"]')).find(node => names.includes(boardItemName(node))),
+      BOARD_SWITCH_TIMEOUT_MS
+    )
+    if (!item) return
+    item.click()
+    // The page redraws on the new board before its cards can be clicked.
+    await until(() => boardSwitcherLabel(boardSwitcherTrigger() ?? trigger) === boardItemName(item), BOARD_SWITCH_TIMEOUT_MS)
+    await pause(150)
+  } catch {
+    // A page that does not look the way this expects leaves the board as the destination.
+  }
+}
+
 /**
  * Open ONE card on the board, after landing there.
  *
@@ -410,6 +485,7 @@ const STATUS_TONE = { blocked: 'bad', cancelled: 'bad', done: 'good', running: '
  * happens to quote the title, harmless: a wrong click costs one attempt and the
  * loop moves on.
  *
+ * A card on another board first switches the page to that board (`showBoardOf`).
  * A card that cannot be found leaves the board as the destination, which is where
  * a plain click landed before this existed.
  */
@@ -424,17 +500,22 @@ function openCardOnBoard(card) {
       node => node.dataset.hwmTried !== '1' && String(node.textContent ?? '').trim().startsWith(title)
     )
 
-  const deadline = Date.now() + CARD_OPEN_TIMEOUT_MS
-  const step = () => {
-    if (isOpen()) return
-    const next = candidates()[0]
-    if (next) {
-      next.dataset.hwmTried = '1'
-      next.click()
+  const run = () => {
+    const deadline = Date.now() + CARD_OPEN_TIMEOUT_MS
+    const step = () => {
+      if (isOpen()) return
+      const next = candidates()[0]
+      if (next) {
+        next.dataset.hwmTried = '1'
+        next.click()
+      }
+      if (Date.now() < deadline) setTimeout(step, 220)
     }
-    if (Date.now() < deadline) setTimeout(step, 220)
+    setTimeout(step, 150)
   }
-  setTimeout(step, 150)
+
+  // The card is only on the page once the page shows its board.
+  showBoardOf(card).then(run, run)
 }
 
 // -- pure helpers -------------------------------------------------------------

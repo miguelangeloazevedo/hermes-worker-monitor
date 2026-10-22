@@ -489,6 +489,34 @@ def test_a_row_click_opens_that_card_on_the_board():
     assert "onClick: () => onOpen(detail.card)" in source
 
 
+def test_a_card_on_another_board_switches_the_page_to_that_board_first():
+    """The page keeps its selected board out of the SDK's reach, so the strip drives the switcher.
+
+    The board menu opens on a pointer-down, not a click, so the trigger gets that
+    event. The trigger is the menu button with the project glyph that is NOT in the
+    statusbar (the app's own counter there carries the same glyph). The menu row
+    is matched on its name with the card count stripped, so a board whose name
+    starts another board's name is not picked by mistake. The helper never throws,
+    and the card loop runs whether or not the switch worked.
+    """
+    source = (
+        Path(__file__).resolve().parent.parent / "desktop" / "plugin.js"
+    ).read_text(encoding="utf-8")
+    assert "async function showBoardOf(card) {" in source
+    assert "showBoardOf(card).then(run, run)" in source
+    assert "button[aria-haspopup=\"menu\"]" in source
+    assert "!node.closest('[data-slot=\"statusbar\"]')" in source
+    assert "new PointerEvent('pointerdown'" in source
+    assert "[role=\"menuitem\"]" in source
+    # The name is compared exactly, after the trailing count is removed.
+    assert "names.includes(boardItemName(node))" in source
+    assert ".replace(/\\s*\\d+\\s*$/, '')" in source
+    # A page that does not look right must not break the open.
+    assert "} catch {" in source.split("async function showBoardOf(card) {", 1)[1].split("\n}\n", 1)[0]
+    # Already on the right board: nothing is opened.
+    assert "names.includes(boardSwitcherLabel(trigger))" in source
+
+
 # -- more than one board ------------------------------------------------------
 
 
